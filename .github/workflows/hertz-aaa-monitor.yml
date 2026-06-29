@@ -39,6 +39,8 @@ jobs:
           HERTZ_RENTAL_LENGTHS: ${{ secrets.HERTZ_RENTAL_LENGTHS }}
           SEND_EMAIL_IF_NO_QUOTES: "true"
           CAPTURE_DEBUG_ARTIFACTS: "true"
+          DEBUG_FAST_MODE: "true"
+          MAX_ATTEMPTS: "3"
         run: python hertz_aaa_monitor.py
 
       - name: Upload debug artifacts
@@ -48,4 +50,3 @@ jobs:
           name: hertz-aaa-monitor-artifacts
           path: artifacts/
           if-no-files-found: ignore
-

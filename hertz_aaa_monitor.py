@@ -38,8 +38,8 @@ DEFAULT_LOCATION_CANDIDATES = [
     "Dulles - Dulles International Airport (IAD)",
     "Washington, DC - Ronald Reagan Washington National Airport (DCA)",
 ]
-DEFAULT_DATE_OFFSETS = [0, 1, 2, 3, 7, 14]
-DEFAULT_RENTAL_LENGTHS = [28, 30, 31, 35]
+DEFAULT_DATE_OFFSETS = [0, 1]
+DEFAULT_RENTAL_LENGTHS = [28, 30]
 
 
 @dataclass
@@ -74,6 +74,11 @@ def env_json(name: str, default):
 
 def ensure_artifacts() -> None:
     ARTIFACT_DIR.mkdir(exist_ok=True)
+
+
+def log(message: str) -> None:
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    print(f"[{timestamp}] {message}", flush=True)
 
 
 def fetch_aaa_offer_details() -> dict:
@@ -156,15 +161,23 @@ class HertzMonitor:
         self.rental_lengths = env_json("HERTZ_RENTAL_LENGTHS", DEFAULT_RENTAL_LENGTHS)
         self.send_if_no_quotes = env_bool("SEND_EMAIL_IF_NO_QUOTES", True)
         self.capture_debug = env_bool("CAPTURE_DEBUG_ARTIFACTS", True)
+        self.debug_fast_mode = env_bool("DEBUG_FAST_MODE", True)
+        self.max_attempts = int(os.getenv("MAX_ATTEMPTS", "3" if self.debug_fast_mode else "999"))
         self.aaa_offer = fetch_aaa_offer_details()
         self.generated_at = datetime.now()
 
     def run(self) -> None:
         ensure_artifacts()
+        log("Starting Hertz AAA monitor")
+        log(f"Locations: {self.locations}")
+        log(f"Date offsets: {self.date_offsets}")
+        log(f"Rental lengths: {self.rental_lengths}")
         quotes: List[QuoteCandidate] = []
         errors: List[str] = []
+        attempts = 0
 
         with sync_playwright() as playwright:
+            log("Launching browser")
             browser = playwright.chromium.launch(headless=True)
             context = browser.new_context(viewport={"width": 1440, "height": 1100})
             page = context.new_page()
@@ -173,26 +186,43 @@ class HertzMonitor:
                 for location in self.locations:
                     for offset in self.date_offsets:
                         for length in self.rental_lengths:
+                            attempts += 1
+                            log(f"Attempt {attempts}: location={location} offset={offset} length={length}")
                             try:
                                 quote = self.collect_quote(page, location, offset, length)
                                 if quote:
+                                    log(f"Quote extracted: total={quote.total_text or 'unavailable'} url={quote.booking_url}")
                                     quotes.append(quote)
+                                else:
+                                    log("Attempt completed with no extractable quote")
                             except Exception as exc:
+                                log(f"Attempt failed: {exc}")
                                 errors.append(f"{location} | +{offset}d | {length}d: {exc}")
                                 if self.capture_debug:
                                     self.save_snapshot(
                                         page,
                                         f"error-{self.safe_name(location)}-{offset}-{length}",
                                     )
+                            if attempts >= self.max_attempts:
+                                log(f"Stopping after {attempts} attempts due to MAX_ATTEMPTS")
+                                break
+                        if attempts >= self.max_attempts:
+                            break
+                    if attempts >= self.max_attempts:
+                        break
             finally:
+                log("Closing browser")
                 browser.close()
 
         best_quote = pick_best_quote(quotes)
         self.write_summary(best_quote, quotes, errors)
+        log(f"Finished attempts. Quotes={len(quotes)} Errors={len(errors)}")
 
         if best_quote or self.send_if_no_quotes:
+            log("Sending email summary")
             subject, html_body, plain_body = self.build_email(best_quote, quotes, errors)
             send_email(subject, html_body, plain_body)
+            log("Email send step completed")
 
     def collect_quote(self, page, location: str, offset_days: int, rental_length: int) -> Optional[QuoteCandidate]:
         pickup_date = date.today() + timedelta(days=offset_days)
@@ -209,14 +239,17 @@ class HertzMonitor:
 
         for url in HERTZ_BOOKING_URLS:
             try:
+                log(f"Opening Hertz URL: {url}")
                 page.goto(url, wait_until="domcontentloaded", timeout=60000)
-                page.wait_for_timeout(3500)
+                page.wait_for_timeout(2500)
                 self.close_cookie_banner(page)
                 self.dismiss_common_modals(page)
                 self.wait_for_booking_form(page)
+                log(f"Booking form detected on {page.url}")
                 return
             except Exception as exc:
                 last_error = exc
+                log(f"URL failed: {url} -> {exc}")
                 if self.capture_debug:
                     self.save_snapshot(
                         page,
@@ -271,7 +304,7 @@ class HertzMonitor:
             "text=View vehicles",
         ]
 
-        for _ in range(30):
+        for _ in range(12 if self.debug_fast_mode else 30):
             self.close_cookie_banner(page)
             self.dismiss_common_modals(page)
 
@@ -309,6 +342,7 @@ class HertzMonitor:
 
     def fill_location(self, page, location: str) -> None:
         field = self.find_location_field(page)
+        log(f"Filling location field with: {location}")
         field.fill(location)
         page.wait_for_timeout(1200)
         field.press("ArrowDown")
@@ -346,6 +380,7 @@ class HertzMonitor:
 
     def set_dates(self, page, pickup_date: date, return_date: date) -> None:
         trigger = self.find_date_trigger(page)
+        log(f"Setting dates: {pickup_date.isoformat()} -> {return_date.isoformat()}")
         trigger.click(timeout=10000)
         self.click_calendar_date(page, pickup_date)
         self.click_calendar_date(page, return_date)
@@ -362,8 +397,9 @@ class HertzMonitor:
             try:
                 locator = page.locator(selector)
                 if locator.count() >= 1 and locator.first.is_visible():
+                    log(f"Clicking submit selector: {selector}")
                     locator.first.click(timeout=15000)
-                    page.wait_for_timeout(8000)
+                    page.wait_for_timeout(5000 if self.debug_fast_mode else 8000)
                     return
             except Exception:
                 continue
