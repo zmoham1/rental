@@ -1,0 +1,51 @@
+name: Hertz AAA Rental Monitor
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 13 * * *"
+
+jobs:
+  check-rates:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install Playwright browsers
+        run: python -m playwright install --with-deps chromium
+
+      - name: Run Hertz AAA monitor
+        env:
+          GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          ALERT_RECIPIENT: ${{ secrets.ALERT_RECIPIENT }}
+          AAA_ZIP_CODE: ${{ secrets.AAA_ZIP_CODE }}
+          TARGET_TOTAL_USD: ${{ secrets.TARGET_TOTAL_USD }}
+          HERTZ_LOCATION_CANDIDATES: ${{ secrets.HERTZ_LOCATION_CANDIDATES }}
+          HERTZ_DATE_OFFSETS: ${{ secrets.HERTZ_DATE_OFFSETS }}
+          HERTZ_RENTAL_LENGTHS: ${{ secrets.HERTZ_RENTAL_LENGTHS }}
+          SEND_EMAIL_IF_NO_QUOTES: "true"
+          CAPTURE_DEBUG_ARTIFACTS: "true"
+        run: python hertz_aaa_monitor.py
+
+      - name: Upload debug artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hertz-aaa-monitor-artifacts
+          path: artifacts/
+          if-no-files-found: ignore
+
