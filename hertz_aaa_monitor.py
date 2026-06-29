@@ -2,8 +2,9 @@
 """
 Daily Hertz + AAA rental monitor for GitHub Actions.
 
-The goal is resilience over perfection: if Hertz changes their flow, the script
-still sends a useful email and uploads artifacts for debugging.
+This version is intentionally defensive: it retries multiple Hertz entry URLs,
+handles banners/modals more carefully, and captures richer debug artifacts when
+the booking form is unavailable.
 """
 
 from __future__ import annotations
@@ -24,6 +25,11 @@ from playwright.sync_api import sync_playwright
 
 
 HERTZ_HOME_URL = "https://www.hertz.com/us/en"
+HERTZ_BOOKING_URLS = [
+    "https://www.hertz.com/us/en",
+    "https://www.hertz.com/us/en/reservation",
+    "https://www.hertz.com/rentacar/reservation/",
+]
 AAA_OFFER_URL = "https://www.hertz.com/us/en/deals-and-offers/aaa/aaa-paynow"
 ARTIFACT_DIR = Path("artifacts")
 DEFAULT_TARGET_TOTAL = 700.0
@@ -174,7 +180,10 @@ class HertzMonitor:
                             except Exception as exc:
                                 errors.append(f"{location} | +{offset}d | {length}d: {exc}")
                                 if self.capture_debug:
-                                    self.save_snapshot(page, f"error-{self.safe_name(location)}-{offset}-{length}")
+                                    self.save_snapshot(
+                                        page,
+                                        f"error-{self.safe_name(location)}-{offset}-{length}",
+                                    )
             finally:
                 browser.close()
 
@@ -189,41 +198,176 @@ class HertzMonitor:
         pickup_date = date.today() + timedelta(days=offset_days)
         return_date = pickup_date + timedelta(days=rental_length)
 
-        page.goto(HERTZ_HOME_URL, wait_until="domcontentloaded", timeout=60000)
-        self.close_cookie_banner(page)
+        self.open_booking_page(page, location, offset_days, rental_length)
         self.fill_location(page, location)
         self.set_dates(page, pickup_date, return_date)
         self.submit_search(page)
         return self.extract_quote(page, location, pickup_date, return_date)
 
+    def open_booking_page(self, page, location: str, offset_days: int, rental_length: int) -> None:
+        last_error: Optional[Exception] = None
+
+        for url in HERTZ_BOOKING_URLS:
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(3500)
+                self.close_cookie_banner(page)
+                self.dismiss_common_modals(page)
+                self.wait_for_booking_form(page)
+                return
+            except Exception as exc:
+                last_error = exc
+                if self.capture_debug:
+                    self.save_snapshot(
+                        page,
+                        f"bootstrap-{self.safe_name(location)}-{offset_days}-{rental_length}-{self.safe_name(url)}",
+                    )
+
+        raise RuntimeError(f"Could not reach Hertz booking form. Last error: {last_error}")
+
     def close_cookie_banner(self, page) -> None:
+        selectors = [
+            "button[aria-label='Close']",
+            "button:has-text('Close')",
+            "button:has-text('Accept')",
+            "button:has-text('Accept All')",
+            "button:has-text('I Agree')",
+            "button:has-text('Continue')",
+        ]
+        for selector in selectors:
+            try:
+                locator = page.locator(selector)
+                if locator.count() >= 1 and locator.first.is_visible():
+                    locator.first.click(timeout=2500)
+                    page.wait_for_timeout(400)
+            except Exception:
+                continue
+
+    def dismiss_common_modals(self, page) -> None:
+        selectors = [
+            "[data-testid='close-button']",
+            "dialog button",
+            ".modal button",
+            "[role='dialog'] button",
+        ]
+        for selector in selectors:
+            try:
+                locator = page.locator(selector)
+                if locator.count() >= 1 and locator.first.is_visible():
+                    text = (locator.first.inner_text(timeout=500) or "").strip().lower()
+                    if text in {"close", "x", "dismiss"} or selector != "dialog button":
+                        locator.first.click(timeout=2000)
+                        page.wait_for_timeout(300)
+            except Exception:
+                continue
+
+    def wait_for_booking_form(self, page) -> None:
+        selectors = [
+            "#locationInput",
+            "input[placeholder='Select your location']",
+            "input[role='combobox']",
+            "#submitButton",
+            "text=Book your Hertz car rental",
+            "text=View vehicles",
+        ]
+
+        for _ in range(30):
+            self.close_cookie_banner(page)
+            self.dismiss_common_modals(page)
+
+            for selector in selectors:
+                try:
+                    locator = page.locator(selector)
+                    if locator.count() >= 1 and locator.first.is_visible():
+                        return
+                except Exception:
+                    continue
+
+            page.wait_for_timeout(1000)
+
+        excerpt = ""
         try:
-            button = page.get_by_role("button", name="Close")
-            if button.count() == 1:
-                button.click(timeout=3000)
+            excerpt = page.locator("body").inner_text(timeout=5000)[:500]
         except Exception:
             pass
+        raise RuntimeError(f"Booking form never became visible at {page.url}. Body excerpt: {excerpt!r}")
+
+    def find_location_field(self, page):
+        selectors = [
+            "#locationInput",
+            "input[placeholder='Select your location']",
+            "input[role='combobox']",
+        ]
+        for selector in selectors:
+            try:
+                locator = page.locator(selector)
+                if locator.count() >= 1 and locator.first.is_visible():
+                    return locator.first
+            except Exception:
+                continue
+        raise RuntimeError(f"Could not find location input on {page.url}")
 
     def fill_location(self, page, location: str) -> None:
-        field = page.locator("#locationInput")
-        field.wait_for(state="visible", timeout=15000)
+        field = self.find_location_field(page)
         field.fill(location)
         page.wait_for_timeout(1200)
         field.press("ArrowDown")
-        page.wait_for_timeout(200)
+        page.wait_for_timeout(250)
         field.press("Enter")
-        page.wait_for_timeout(1000)
+        page.wait_for_timeout(1200)
+
+    def find_date_trigger(self, page):
+        selectors = [
+            "#dateTimePickerTriggerFrom",
+            "input[aria-label='PickUpLocationSelect']",
+        ]
+        for selector in selectors:
+            try:
+                locator = page.locator(selector)
+                if locator.count() >= 1 and locator.first.is_visible():
+                    return locator.first
+            except Exception:
+                continue
+        raise RuntimeError(f"Could not find pickup date trigger on {page.url}")
+
+    def click_calendar_date(self, page, target_date: date) -> None:
+        labels = [
+            target_date.strftime("%a %b %d %Y"),
+            target_date.strftime("%A %b %d %Y"),
+        ]
+        last_error: Optional[Exception] = None
+        for label in labels:
+            try:
+                page.get_by_label(label).click(timeout=8000)
+                return
+            except Exception as exc:
+                last_error = exc
+        raise RuntimeError(f"Could not click calendar date {target_date.isoformat()}: {last_error}")
 
     def set_dates(self, page, pickup_date: date, return_date: date) -> None:
-        page.locator("#dateTimePickerTriggerFrom").click(timeout=10000)
-        page.get_by_label(pickup_date.strftime("%a %b %d %Y")).click(timeout=15000)
-        page.get_by_label(return_date.strftime("%a %b %d %Y")).click(timeout=15000)
+        trigger = self.find_date_trigger(page)
+        trigger.click(timeout=10000)
+        self.click_calendar_date(page, pickup_date)
+        self.click_calendar_date(page, return_date)
         page.get_by_role("button", name="Apply").click(timeout=10000)
         page.wait_for_timeout(500)
 
     def submit_search(self, page) -> None:
-        page.locator("#submitButton").click(timeout=15000)
-        page.wait_for_timeout(8000)
+        selectors = [
+            "#submitButton",
+            "button[type='submit']",
+            "button:has-text('View vehicles')",
+        ]
+        for selector in selectors:
+            try:
+                locator = page.locator(selector)
+                if locator.count() >= 1 and locator.first.is_visible():
+                    locator.first.click(timeout=15000)
+                    page.wait_for_timeout(8000)
+                    return
+            except Exception:
+                continue
+        raise RuntimeError(f"Could not find submit button on {page.url}")
 
     def extract_quote(
         self,
@@ -248,8 +392,8 @@ class HertzMonitor:
         aaa_applied = "AAA" in compact.upper()
         booking_url = page.url
         notes = ""
-        if booking_url == HERTZ_HOME_URL:
-            notes = "Search stayed on the Hertz home page; quote may be partial."
+        if booking_url in HERTZ_BOOKING_URLS:
+            notes = "Search stayed on a Hertz entry page; quote may be partial."
 
         if best_price is None and vehicle_match is None and not notes:
             return None
@@ -268,7 +412,10 @@ class HertzMonitor:
         )
 
         if self.capture_debug:
-            self.save_snapshot(page, f"quote-{self.safe_name(location)}-{pickup_date.isoformat()}-{rental_length_days(pickup_date, return_date)}")
+            self.save_snapshot(
+                page,
+                f"quote-{self.safe_name(location)}-{pickup_date.isoformat()}-{rental_length_days(pickup_date, return_date)}",
+            )
 
         return quote
 
@@ -387,4 +534,3 @@ def rental_length_days(pickup_date: date, return_date: date) -> int:
 
 if __name__ == "__main__":
     HertzMonitor().run()
-
